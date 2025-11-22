@@ -1653,3 +1653,424 @@ def generate_memberB(root: str,
 
 for chunk_id in range(5):
       generate_memberB("/content/drive/MyDrive/3D_DATASETS/Harsh", n_objects=10000, chunk_id=chunk_id, chunk_size=10000, seed=200+chunk_id)
+
+
+#Ronit:- Code for Ring and torus family
+
+import os, csv, math, random, json, time, traceback
+from typing import Dict, Any, List, Tuple
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+
+class Mesh:
+    def __init__(self, vertices: np.ndarray, faces: np.ndarray):
+        self.vertices = vertices.astype(np.float32)
+        self.faces = faces.astype(np.int32)
+
+    def copy(self):
+        return Mesh(self.vertices.copy(), self.faces.copy())
+
+    def transform(self, M: np.ndarray):
+        V = self.vertices
+        ones = np.ones((len(V),1), np.float32)
+        Vh = np.hstack([V, ones]) @ M.T
+        self.vertices = Vh[:,:3] / (Vh[:,3:4] + 1e-9)
+        return self
+
+def make_torus(R=1.3, r=0.45, seg=48, rings=24):
+    V = []
+    for i in range(seg):
+        u = 2*math.pi*i/seg
+        cu, su = math.cos(u), math.sin(u)
+        for j in range(rings):
+            v = 2*math.pi*j/rings
+            cv, sv = math.cos(v), math.sin(v)
+            x = (R + r*cv) * cu
+            y = (R + r*cv) * su
+            z = r * sv
+            V.append((x,y,z))
+    V = np.array(V, np.float32)
+    F = []
+    def vid(i,j): return (i%seg)*rings + (j%rings)
+    for i in range(seg):
+        for j in range(rings):
+            a=vid(i,j); b=vid(i+1,j); c=vid(i+1,j+1); d=vid(i,j+1)
+            F.append((a,b,c)); F.append((a,c,d))
+    return Mesh(V, np.array(F, np.int32))
+
+def make_thin_torus(R=1.6, r=0.2, seg=64, rings=32):
+    return make_torus(R=R, r=r, seg=seg, rings=rings)
+
+def make_ring_plate(outer_r=1.2, inner_r=0.6, seg=96):
+    return make_torus(R=(outer_r+inner_r)/2.0, r=(outer_r-inner_r)/2.0, seg=seg, rings=8)
+
+def make_organic(seed=None, base_radius=1.0, detail=64, irregularity=0.15):
+    """
+    Generate an irregular organic-looking blob by perturbing a subdivided sphere.
+    - detail: number of longitude segments (higher -> more vertices)
+    - irregularity: scale of radial displacement noise
+    """
+    rng = np.random.RandomState(seed)
+    seg = max(24, detail)
+    rings = max(12, detail//2)
+    V = []
+    for i in range(rings+1):
+        phi = math.pi * i / rings
+        y = base_radius * math.cos(phi)
+        rr = base_radius * math.sin(phi)
+        for j in range(seg):
+            t = 2*math.pi*j/seg
+            V.append((rr*math.cos(t), y, rr*math.sin(t)))
+    V = np.array(V, np.float32)
+    r = np.linalg.norm(V, axis=1, keepdims=True)
+    noise = rng.normal(scale=irregularity, size=V.shape)
+    V = V + noise * (1.0 + r)
+    F = []
+    def vid(i,j): return i*seg + (j%seg)
+    for i in range(rings):
+        for j in range(seg):
+            F.append((vid(i,j), vid(i,j+1), vid(i+1,j+1)))
+            F.append((vid(i,j), vid(i+1,j+1), vid(i+1,j)))
+    return Mesh(V, np.array(F, np.int32))
+
+SHAPE_FACTORIES = {
+    "torus": make_torus,
+    "thin_torus": make_thin_torus,
+    "ring_plate": make_ring_plate,
+    "organic_blob": make_organic
+}
+
+def sin_wave(mesh: Mesh, params):
+    amp = float(params.get("amp", 0.05)); freq = float(params.get("freq",2.0)); axis = params.get("axis","x")
+    V = mesh.vertices.copy(); c = {"x":0,"y":1,"z":2}[axis]; V[:,c] += amp * np.sin(freq * V[:,(c+1)%3]); mesh.vertices = V; return mesh
+
+def taper(mesh: Mesh, params):
+    top_scale = float(params.get("top_scale",0.9)); bottom_scale = float(params.get("bottom_scale",1.05))
+    V = mesh.vertices.copy(); y = V[:,1]; ymin,ymax = y.min(), y.max(); t=(y-ymin)/(ymax-ymin+1e-9); mesh.vertices = V * ( (bottom_scale + (top_scale-bottom_scale)*t)[:,None] ); return mesh
+
+def bulge_center(mesh: Mesh, params):
+    strength = float(params.get("strength",0.12)); V = mesh.vertices.copy(); center = V.mean(axis=0); d = V - center; r = np.linalg.norm(d,axis=1,keepdims=True); V += d * (strength * np.exp(-r**2)); mesh.vertices = V; return mesh
+
+def bend(mesh: Mesh, params):
+    axis = params.get("axis","x"); angle = float(params.get("angle",0.1)); V = mesh.vertices.copy();
+    if axis=='x': V[:,2] += angle * V[:,1]
+    else: V[:,2] += angle * V[:,0]
+    mesh.vertices = V; return mesh
+
+def twist(mesh: Mesh, params):
+    angle = float(params.get("angle",0.6)); axis = params.get("axis","y"); V = mesh.vertices.copy()
+    if axis=="y":
+        ys = V[:,1]; ymin,ymax = ys.min(), ys.max(); t=(ys-ymin)/(ymax-ymin+1e-9); thetas = angle * t
+        c = np.cos(thetas); s = np.sin(thetas); x=V[:,0]; z=V[:,2]; V[:,0]=x*c - z*s; V[:,2]=x*s + z*c
+    else:
+        xs = V[:,0]; xmin,xmax = xs.min(), xs.max(); t=(xs-xmin)/(xmax-xmin+1e-9); thetas = angle*t
+        c=np.cos(thetas); s=np.sin(thetas); y=V[:,1]; z=V[:,2]; V[:,1]=y*c - z*s; V[:,2]=y*s + z*c
+    mesh.vertices = V; return mesh
+
+def noise_surface(mesh: Mesh, params):
+    strength = float(params.get("strength",0.02)); scale = float(params.get("scale",1.0)); seed = params.get("seed", None)
+    rng = np.random.RandomState(seed); V = mesh.vertices.copy(); r = np.linalg.norm(V - V.mean(axis=0), axis=1, keepdims=True)
+    V += rng.normal(scale=strength, size=V.shape) * (1 + r/scale); mesh.vertices = V; return mesh
+
+def shear(mesh: Mesh, params):
+    axis = params.get("axis","x"); factor=float(params.get("factor",0.15)); V = mesh.vertices.copy()
+    if axis=="x": V[:,0] += factor * V[:,1]
+    elif axis=="y": V[:,1] += factor * V[:,0]
+    else: V[:,2] += factor * V[:,0]
+    mesh.vertices = V; return mesh
+
+def scale_nonuniform(mesh: Mesh, params):
+    sx=float(params.get("sx",1.0)); sy=float(params.get("sy",1.0)); sz=float(params.get("sz",1.0))
+    mesh.vertices = mesh.vertices.copy() * np.array([sx,sy,sz])[None,:]; return mesh
+
+def stretch_wave(mesh: Mesh, params):
+    amp=float(params.get("amp",0.05)); freq=float(params.get("freq",2.0)); axis=params.get("axis","y"); V = mesh.vertices.copy()
+    c={"x":0,"y":1,"z":2}[axis]; V[:,c] *= (1.0 + amp * np.sin(freq * V[:,(c+1)%3])); mesh.vertices = V; return mesh
+
+def pinch_top(mesh: Mesh, params):
+    strength=float(params.get("strength",0.4)); V = mesh.vertices.copy(); y=V[:,1]; ymin,ymax = y.min(), y.max(); t=(y-ymin)/(ymax-ymin+1e-9); scale = 1.0 - strength * (t**2); mesh.vertices = V * scale[:,None]; return mesh
+
+def inflate_bottom(mesh: Mesh, params):
+    strength=float(params.get("strength",0.3)); V=mesh.vertices.copy(); y=V[:,1]; ymin,ymax = y.min(), y.max(); t=1.0-(y-ymin)/(ymax-ymin+1e-9); scale = 1.0 + strength * (t**1.5); mesh.vertices = V * scale[:,None]; return mesh
+
+def squeeze_center(mesh, params):
+    """
+    Smooth waist shrink without broadcasting errors.
+    """
+    ratio = float(params.get("ratio", 0.6))
+
+    V = mesh.vertices.copy()
+    center = V.mean(axis=0)
+    d = V - center
+    r = np.linalg.norm(d, axis=1, keepdims=True) 
+    rmax = r.max() + 1e-9
+
+    weight = 1.0 - (r / rmax)       
+
+    scale = ratio + (1 - ratio) * (1 - weight)  
+
+    V = center + d * scale 
+
+    mesh.vertices = V
+    return mesh
+
+def twist_sin(mesh: Mesh, params):
+    amp=float(params.get("amp",0.5)); freq=float(params.get("freq",3.0)); V=mesh.vertices.copy(); ys=V[:,1]; ymin,ymax=ys.min(), ys.max(); t=(ys-ymin)/(ymax-ymin+1e-9); thetas = amp * np.sin(freq * t); c=np.cos(thetas); s=np.sin(thetas); x=V[:,0]; z=V[:,2]; V[:,0]=x*c - z*s; V[:,2]=x*s + z*c; mesh.vertices = V; return mesh
+
+def wobble(mesh: Mesh, params):
+    amp1=float(params.get("amp1",0.03)); freq1=float(params.get("freq1",2.0)); amp2=float(params.get("amp2",0.02)); freq2=float(params.get("freq2",5.0))
+    V=mesh.vertices.copy(); V[:,0] += amp1 * np.sin(freq1 * V[:,1]) + amp2 * np.sin(freq2 * V[:,2]); V[:,2] += amp1 * np.cos(freq1 * V[:,1]) + amp2 * np.cos(freq2 * V[:,0]); mesh.vertices = V; return mesh
+
+def crumple(mesh: Mesh, params):
+    detail=int(params.get("detail",6)); intensity=float(params.get("intensity",0.02)); seed=params.get("seed",None)
+    rng = np.random.RandomState(seed); V=mesh.vertices.copy(); noise = rng.normal(scale=intensity, size=V.shape)
+    for o in range(detail): V += noise * (0.5**o)
+    mesh.vertices = V; return mesh
+
+def spiral(mesh: Mesh, params):
+    turns=float(params.get("turns",2.0)); radius_scale=float(params.get("radius_scale",0.2)); V=mesh.vertices.copy(); ys=V[:,1]; ymin,ymax=ys.min(), ys.max(); t=(ys-ymin)/(ymax-ymin+1e-9); thetas = 2*math.pi*turns*t; V[:,0] += radius_scale * np.cos(thetas); V[:,2] += radius_scale * np.sin(thetas); mesh.vertices = V; return mesh
+
+def wave_height(mesh: Mesh, params):
+    amp=float(params.get("amp",0.03)); freq=float(params.get("freq",2.0)); V=mesh.vertices.copy(); V[:,1] += amp * np.sin(freq * V[:,0]); mesh.vertices = V; return mesh
+
+def bulge_axis(mesh: Mesh, params):
+    axis = params.get("axis","x"); strength = float(params.get("strength",0.12)); V = mesh.vertices.copy(); center = V.mean(axis=0); d = V - center
+    if axis == "x":
+        r = np.abs(d[:,0:1])   
+    else:
+        r = np.abs(d[:,1:2])
+    V += d * (strength * np.exp(-(r**2)))
+    mesh.vertices = V; return mesh
+
+def random_scale(mesh: Mesh, params):
+    sx = float(params.get("sx", random.uniform(0.85,1.2))); sy=float(params.get("sy", random.uniform(0.85,1.2))); sz=float(params.get("sz", random.uniform(0.85,1.2)))
+    mesh.vertices = mesh.vertices.copy() * np.array([sx,sy,sz])[None,:]; return mesh
+
+def offset_center(mesh: Mesh, params):
+    off = float(params.get("off",0.2)); dirv = np.array(params.get("dir",[1.0,0.0,0.0]), np.float32); dirv = dirv / (np.linalg.norm(dirv)+1e-9)
+    V = mesh.vertices.copy(); V += off * dirv[None,:]; mesh.vertices = V; return mesh
+
+DEFORM_REGISTRY = {
+    "sin": sin_wave, "taper": taper, "bulge_center": bulge_center, "bend": bend, "twist": twist,
+    "noise": noise_surface, "shear": shear, "scale_nonuniform": scale_nonuniform, "stretch_wave": stretch_wave,
+    "pinch_top": pinch_top, "inflate_bottom": inflate_bottom, "squeeze_center": squeeze_center, "twist_sin": twist_sin,
+    "wobble": wobble, "crumple": crumple, "spiral": spiral, "wave_height": wave_height, "bulge_axis": bulge_axis,
+    "random_scale": random_scale, "offset_center": offset_center
+}
+
+def compute_normals(mesh: Mesh):
+    V = mesh.vertices; F = mesh.faces
+    N = np.zeros_like(V)
+    for a,b,c in F:
+        n = np.cross(V[b]-V[a], V[c]-V[a])
+        N[a] += n; N[b] += n; N[c] += n
+    N = N / (np.linalg.norm(N, axis=1, keepdims=True) + 1e-9)
+    return N
+
+def project_xyz(mesh: Mesh, axis):
+    V = mesh.vertices
+    if axis=="z": XY = V[:,[0,1]]; Z = V[:,2]
+    elif axis=="y": XY = V[:,[0,2]]; Z = V[:,1]
+    else: XY = V[:,[1,2]]; Z = V[:,0]
+    return XY, Z
+
+def normalize_xy(XY, size, pad=0.1):
+    mn = XY.min(0); mx = XY.max(0); ctr = (mn+mx)/2; extent = max(mx-mn)
+    s = (1-2*pad) * size / (extent + 1e-9)
+    return (XY - ctr) * s + size/2.0
+
+def render(mesh: Mesh, axis="z", size=256):
+    XY, Z = project_xyz(mesh, axis); XYs = normalize_xy(XY, size); N = compute_normals(mesh); light = np.array([0.0,0.0,1.0], np.float32)
+    img = np.zeros((size,size), np.float32); mask = np.zeros((size,size), np.uint8); depth = np.full((size,size), np.inf)
+    P = XYs; VZ = Z; F = mesh.faces
+    for a,b,c in F:
+        pa,pb,pc = P[a], P[b], P[c]; za,zb,zc = VZ[a],VZ[b],VZ[c]; na,nb,nc = N[a],N[b],N[c]
+        xmin = max(int(min(pa[0],pb[0],pc[0])), 0); xmax = min(int(max(pa[0],pb[0],pc[0])), size-1)
+        ymin = max(int(min(pa[1],pb[1],pc[1])), 0); ymax = min(int(max(pa[1],pb[1],pc[1])), size-1)
+        if xmin>=xmax or ymin>=ymax: continue
+        area = (pb[0]-pa[0])*(pc[1]-pa[1]) - (pb[1]-pa[1])*(pc[0]-pa[0])
+        if abs(area) < 1e-8: continue
+        xs = np.arange(xmin, xmax+1); ys = np.arange(ymin, ymax+1); XX, YY = np.meshgrid(xs, ys)
+        w0 = ((pb[0]-pa[0])*(YY-pa[1]) - (pb[1]-pa[1])*(XX-pa[0]))/area
+        w1 = ((pc[0]-pb[0])*(YY-pb[1]) - (pc[1]-pb[1])*(XX-pb[0]))/area
+        w2 = 1 - w0 - w1
+        inside = (w0>=0) & (w1>=0) & (w2>=0)
+        if not inside.any(): continue
+        zpix = w2*za + w0*zb + w1*zc
+        dm = depth[ymin:ymax+1, xmin:xmax+1]; upd = inside & (zpix < dm)
+        if not upd.any(): continue
+        dm[upd] = zpix[upd]; depth[ymin:ymax+1, xmin:xmax+1] = dm
+        n_pix = w2[...,None]*na + w0[...,None]*nb + w1[...,None]*nc
+        n_pix = n_pix / (np.linalg.norm(n_pix, axis=-1, keepdims=True) + 1e-9)
+        intensity = np.maximum(0.0, np.sum(n_pix * light, axis=-1))
+        block = img[ymin:ymax+1, xmin:xmax+1]; block[upd] = intensity[upd]; img[ymin:ymax+1, xmin:xmax+1] = block
+        mblock = mask[ymin:ymax+1, xmin:xmax+1]; mblock[upd] = 255; mask[ymin:ymax+1, xmin:xmax+1] = mblock
+    img_u8 = (img*255).astype(np.uint8)
+    valid = np.isfinite(depth)
+    if valid.any():
+        d = depth.copy(); d[~valid] = d[valid].max(); d = (d - d[valid].min()) / (d[valid].max() - d[valid].min() + 1e-9); depth_u8 = (d*255).astype(np.uint8)
+    else:
+        depth_u8 = np.zeros_like(img_u8)
+    return img_u8, mask, depth_u8
+
+def export_obj(mesh: Mesh, path):
+    with open(path, "w") as f:
+        for x,y,z in mesh.vertices: f.write(f"v {x} {y} {z}\n")
+        for a,b,c in mesh.faces: f.write(f"f {a+1} {b+1} {c+1}\n")
+
+def _read_manifest_set(manifest_path: str) -> set:
+    if not os.path.exists(manifest_path): return set()
+    seen = set()
+    try:
+        with open(manifest_path, newline="") as mf:
+            r = csv.reader(mf)
+            header = next(r, None)
+            for row in r:
+                if len(row) >= 1:
+                    seen.add(row[0])
+    except Exception:
+        pass
+    return seen
+
+def generate_memberC(root: str,
+                     n_objects: int = 10000,
+                     chunk_id: int = 0,
+                     chunk_size: int = 10000,
+                     views: Tuple[str,...] = ("x","y","z"),
+                     seed: int = 300,
+                     size: int = 256,
+                     deforms: List[str] = None):
+    os.makedirs(root, exist_ok=True)
+    obj_dir = os.path.join(root, "obj"); img_dir = os.path.join(root,"img"); mask_dir = os.path.join(root,"mask"); depth_dir = os.path.join(root,"depth")
+    os.makedirs(obj_dir, exist_ok=True); os.makedirs(img_dir, exist_ok=True); os.makedirs(mask_dir, exist_ok=True); os.makedirs(depth_dir, exist_ok=True)
+    manifest_path = os.path.join(root, "manifest.csv")
+    checkpoint_path = os.path.join(root, f".checkpoint_chunk{chunk_id}.json")
+    random.seed(seed); np.random.seed(seed)
+    if deforms is None: deforms = list(DEFORM_REGISTRY.keys())
+    seen_ids = _read_manifest_set(manifest_path)
+    start_idx = 0
+    if os.path.exists(checkpoint_path):
+        try:
+            with open(checkpoint_path, "r") as cf:
+                data = json.load(cf); start_idx = int(data.get("last_idx", 0))
+        except Exception:
+            start_idx = 0
+    mf = open(manifest_path, "a", newline=""); writer = csv.writer(mf)
+    if os.path.getsize(manifest_path) == 0:
+        writer.writerow(["id","shape","deforms","params_json","view","obj","img","mask","depth","chunk_id","timestamp"])
+
+    try:
+        for i in tqdm(range(start_idx, n_objects), initial=start_idx, total=n_objects, desc=f"Chunk {chunk_id} (Member C)"):
+            global_id = f"{chunk_id:03d}_{i:07d}"
+            if global_id in seen_ids: continue
+            try:
+                shape_key = random.choice(["torus","thin_torus","ring_plate","organic_blob"])
+                if shape_key == "torus":
+                    R = random.uniform(0.9,2.0); r = random.uniform(0.15,0.7); seg=random.choice([36,48,64]); rings=random.choice([18,24])
+                    mesh = make_torus(R=R, r=r, seg=seg, rings=rings)
+                elif shape_key == "thin_torus":
+                    R = random.uniform(1.2,2.4); r = random.uniform(0.08,0.28); mesh = make_thin_torus(R=R, r=r, seg=64, rings=28)
+                elif shape_key == "ring_plate":
+                    outer = random.uniform(0.8,1.8); inner = random.uniform(0.3, outer-0.1); mesh = make_ring_plate(outer_r=outer, inner_r=inner, seg=random.choice([64,96]))
+                else:
+                    mesh = make_organic(seed=random.randint(0,2**31-1), base_radius=random.uniform(0.7,1.6), detail=random.choice([48,64,96]), irregularity=random.uniform(0.04,0.22))
+
+                k = random.choice([1,1,2])
+                chosen = list(np.random.choice(deforms, size=k, replace=False))
+                params = {}
+                for d in chosen:
+                    if d == "sin":
+                        params[d] = {"amp": random.uniform(0.02,0.12), "freq": random.uniform(1.0,4.0), "axis": random.choice(["x","y","z"])}
+                    elif d == "taper":
+                        params[d] = {"top_scale": random.uniform(0.75,0.98), "bottom_scale": random.uniform(0.85,1.25)}
+                    elif d == "bulge_center":
+                        params[d] = {"strength": random.uniform(0.04,0.3)}
+                    elif d == "bend":
+                        params[d] = {"axis": random.choice(["x","y"]), "angle": random.uniform(0.02,0.35)}
+                    elif d == "twist":
+                        params[d] = {"angle": random.uniform(0.1,1.5), "axis": random.choice(["y","x"])}
+                    elif d == "noise":
+                        params[d] = {"strength": random.uniform(0.006,0.05), "scale": random.uniform(0.4,2.5), "seed": random.randint(0,2**31-1)}
+                    elif d == "shear":
+                        params[d] = {"axis": random.choice(["x","y","z"]), "factor": random.uniform(-0.25,0.25)}
+                    elif d == "scale_nonuniform":
+                        params[d] = {"sx": random.uniform(0.7,1.4), "sy": random.uniform(0.7,1.4), "sz": random.uniform(0.7,1.4)}
+                    elif d == "stretch_wave":
+                        params[d] = {"amp": random.uniform(0.02,0.12), "freq": random.uniform(1.0,4.0), "axis": random.choice(["x","y","z"])}
+                    elif d == "pinch_top":
+                        params[d] = {"strength": random.uniform(0.12,0.6)}
+                    elif d == "inflate_bottom":
+                        params[d] = {"strength": random.uniform(0.1,0.45)}
+                    elif d == "squeeze_center":
+                        params[d] = {"ratio": random.uniform(0.45,0.95)}
+                    elif d == "twist_sin":
+                        params[d] = {"amp": random.uniform(0.15,1.4), "freq": random.uniform(1.0,6.0)}
+                    elif d == "wobble":
+                        params[d] = {"amp1": random.uniform(0.008,0.06), "freq1": random.uniform(0.8,4.0), "amp2": random.uniform(0.004,0.03), "freq2": random.uniform(3.0,9.0)}
+                    elif d == "crumple":
+                        params[d] = {"detail": random.randint(3,12), "intensity": random.uniform(0.003,0.04), "seed": random.randint(0,2**31-1)}
+                    elif d == "spiral":
+                        params[d] = {"turns": random.uniform(0.5,5.0), "radius_scale": random.uniform(0.02,0.45)}
+                    elif d == "wave_height":
+                        params[d] = {"amp": random.uniform(0.02,0.08), "freq": random.uniform(0.7,4.5)}
+                    elif d == "bulge_axis":
+                        params[d] = {"axis": random.choice(["x","y"]), "strength": random.uniform(0.04,0.3)}
+                    elif d == "random_scale":
+                        params[d] = {"sx": random.uniform(0.8,1.25), "sy": random.uniform(0.8,1.25), "sz": random.uniform(0.8,1.25)}
+                    elif d == "offset_center":
+                        params[d] = {"off": random.uniform(-0.35,0.35), "dir": [random.uniform(-1,1) for _ in range(3)]}
+                    else:
+                        params[d] = {}
+
+                mesh = mesh.copy()
+                try:
+                    for d in chosen:
+                        mesh = DEFORM_REGISTRY[d](mesh, params[d])
+                except Exception as e:
+                    print("Deform error:", e); traceback.print_exc(); continue
+
+                vmax = np.abs(mesh.vertices).max() + 1e-9
+                mesh.transform(np.diag([1.0/vmax,1.0/vmax,1.0/vmax,1.0]))
+
+                obj_name = f"{global_id}_{shape_key}_{'_'.join(chosen)}.obj"
+                obj_path = os.path.join(obj_dir, obj_name)
+                try:
+                    export_obj(mesh, obj_path)
+                except Exception as e:
+                    print("OBJ save failed:", e); traceback.print_exc(); continue
+
+                timestamp = time.time()
+                for view in views:
+                    try:
+                        img, mask, depth = render(mesh, view, size=size)
+                        img_path = os.path.join(img_dir, f"{global_id}_{shape_key}_{'_'.join(chosen)}_{view}.png")
+                        mask_path = os.path.join(mask_dir, f"{global_id}_{shape_key}_{'_'.join(chosen)}_{view}.png")
+                        depth_path = os.path.join(depth_dir, f"{global_id}_{shape_key}_{'_'.join(chosen)}_{view}.png")
+                        Image.fromarray(img).save(img_path); Image.fromarray(mask).save(mask_path); Image.fromarray(depth).save(depth_path)
+                        writer.writerow([global_id, shape_key, ";".join(chosen), json.dumps(params), view, obj_path, img_path, mask_path, depth_path, chunk_id, timestamp])
+                        mf.flush()
+                    except Exception as e:
+                        print("Render/save failed:", e); traceback.print_exc(); continue
+
+                seen_ids.add(global_id)
+                with open(checkpoint_path, "w") as cf:
+                    json.dump({"last_idx": i+1, "timestamp": time.time()}, cf)
+
+            except Exception as e:
+                print("Object generation error:", e); traceback.print_exc(); continue
+    finally:
+        mf.close()
+
+    print(f"Chunk {chunk_id} finished. Manifest: {manifest_path}, checkpoint: {checkpoint_path}")
+for chunk_id in range(20):
+    out = f"/content/drive/MyDrive/3D_DATASETS/Ronit/lathe/chunk_{chunk_id:02d}"
+    generate_memberA_lathe(
+        out,
+        n_objects=10000,
+        chunk_id=chunk_id,
+        chunk_size=10000,
+        views=('x','y','z'),
+        seed=100 + chunk_id,
+        size=256
+    )
